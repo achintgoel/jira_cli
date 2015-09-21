@@ -1,0 +1,256 @@
+#!/usr/bin/env ruby
+require 'gli'
+require 'git'
+require 'jira_cli'
+require 'rainbow'
+require 'highline/import'
+
+include GLI::App
+
+program_desc 'JIRA CLI'
+
+version JiraCli::VERSION
+
+subcommand_option_handling :normal
+arguments :strict
+
+def setup_config
+  username    = ask("What's your JIRA username/email ")
+  password    = ask("What's your JIRA password ") { |q| q.echo = "x" }
+  project_keys = ask("Project Key(s)? (For multiple projects, comma separate Keys) ")
+
+  @jira.setup(username, password, project_keys)
+  puts Rainbow("Configuration has been saved to `#{@jira.config_file}`.").yellow
+end
+
+def ensure_setup_complete
+  unless @jira.setup_complete?
+    puts Rainbow("Missing configuration file `#{@jira.config_file}`. Let's get you setup.").yellow
+    setup_config
+  end
+  @jira.load_client
+end
+
+def formatted_issue(issue, index = nil)
+  # estimate = (1..8).map { |i| i <= story.estimate.to_i ? '*' : ' ' }.join
+  #
+  # output =  '  '
+  output = '  '
+  output << "#{index.to_s.rjust(2)}: " unless index.nil?
+  output << Rainbow("#{issue.key} ").yellow
+  #output << Rainbow("#{story.current_state.rjust(11)} [#{estimate}] ").blue
+  output << issue.summary
+  output
+end
+
+def ask_which_issue(ask_new = false)
+  if ask_new
+    create_new = ask("Would you like to create a new issue (Y/N): ")
+    create_new = create_new.strip.downcase == 'y'
+  end
+
+  if create_new
+    @jira.projects.each.with_index(1) do |project, index|
+      puts Rainbow("#{index}: #{project.key}").yellow
+    end
+    question = Rainbow("\nWhich project does the new issue belong to? ").green
+    selected_index = ask(question, Integer) { |q| q.in = 1..(@jira.projects.length) }
+    summary = ask(Rainbow('Issue summary? ').green)
+    description = ask(Rainbow('Issue description? ').green)
+    puts "Creating issue in #{@jira.projects[selected_index - 1].key}..."
+    issue = @jira.create_issue(summary, description, @jira.projects[selected_index - 1].id)
+    puts Rainbow("^ This issue still needs to be added to the current sprint...").red
+    issue
+  else
+    issues_by_index = []
+    issue_index = 1
+    @jira.my_issues_per_project.each do |id, name, issues|
+      puts Rainbow("\n  == #{name} - #{issues.length} issu#{issues.length == 1 ? 'e' : 'es'} assigned to you.\n").green
+
+      # Show all, yay!
+      issues.each do |issue|
+        puts formatted_issue(issue, issue_index)
+        issues_by_index[issue_index] = issue
+        issue_index += 1
+      end
+    end
+
+    question = Rainbow("\nWhich of the #{issue_index - 1} issues? ").green
+    selected_index = ask(question, Integer) { |q| q.in = 1..(issue_index - 1) }
+    issues_by_index[selected_index]
+  end
+
+end
+
+def find_issue(key, allow_create = false)
+  issue = key && @jira.find_issue(key)
+
+  if issue.nil?
+    issue = ask_which_issue(allow_create)
+  end
+
+  issue
+end
+
+def find_issue_from_branch
+  git = Git.open(Dir.pwd)
+  branch = git.current_branch.to_s
+
+  matches = branch.match(/.+-(?<issue_project_key>.+)-(?<issue_id>\d+)/)
+  if matches && matches['issue_project_key'] && matches['issue_id']
+    issue_key = "#{matches['issue_project_key']}-#{matches['issue_id']}"
+    issue = @jira.find_issue(issue_key)
+    if issue
+      puts Rainbow("Found issue #{issue.key}").green
+      return issue
+    else
+      puts Rainbow("No jira issue found with key #{issue_key}.").red
+      return nil
+    end
+  else
+    puts Rainbow("No jira issue found based on branch name.").red
+    return nil
+  end
+end
+
+desc 'Describe some switch here'
+switch [:s,:switch]
+
+desc 'Describe some flag here'
+default_value 'the default'
+arg_name 'The name of the argument'
+flag [:f,:flagname]
+
+desc 'Display JIRA issues assigned to you'
+command :list do |c|
+  c.action do |global_options,options,args|
+    ensure_setup_complete
+    issues_per_project = @jira.my_issues_per_project
+    issues_per_project.each do |id, name, issues|
+      next if issues.length == 0
+
+      puts Rainbow("\n  == #{name} - #{issues.length} issu#{issues.length == 1 ? 'e' : 'es'} assigned to you.\n").green
+      issues.each do |issue|
+        puts formatted_issue(issue)
+      end
+    end
+  end
+end
+
+desc 'Start a JIRA issue, and create a branch for it'
+arg_name '<branchname> [issue key]'
+command :branch do |c|
+  c.action do |global_options,options,args|
+    ensure_setup_complete
+    if args.length < 1
+      puts Rainbow("\n  Please specify a branch name to create.\n").red
+      next
+    end
+
+    branch_name = args[0]
+    issue = find_issue(args[1], true)
+
+    # Checkout branch
+    branch_name = "#{branch_name}-#{issue.key}"
+    command = "git checkout -b #{branch_name}"
+    puts "Executing: #{command}"
+    success = system(command)
+
+    # Update status
+    if success
+      @jira.in_progress(issue)
+      puts Rainbow("Set issue #{issue.key} as 'Started'\n").green
+    else
+      puts Rainbow("^ Whoops, something went wrong...").red
+    end
+  end
+end
+
+desc 'Commit changes for a jira task'
+arg_name '<commit>'
+command :commit do |c|
+  c.action do |global_options,options,args|
+    ensure_setup_complete
+    issue = find_issue_from_branch
+    if issue
+      git = Git.open(Dir.pwd)
+      git.add(all: true)
+      puts 'git add -A'
+
+      commit_message = "#{issue.summary.gsub('"', '\"')} [##{issue.key}]"
+      git.commit(commit_message)
+      puts "git commit -m #{commit_message}"
+    end
+  end
+end
+
+desc 'Create a pull request from current branch'
+command :'pull-request' do |c|
+  c.action do |global_options,options,args|
+    ensure_setup_complete
+    issue = find_issue_from_branch
+    if issue
+      command = "hub pull-request -m \"#{issue.summary.gsub('"', '\"')}\""
+      puts command
+      if system(command)
+        @jira.in_review(issue)
+        puts Rainbow("Set issue #{issue.key} as 'In Review'\n").green
+      else
+        puts Rainbow("^ Whoops, something went wrong...").red
+      end
+    end
+  end
+end
+
+desc 'Land a pull request from current branch'
+command :land do |c|
+  c.action do |global_options,options,args|
+    ensure_setup_complete
+    issue = find_issue_from_branch
+    if issue
+      command = "hub land"
+      puts command
+      if system(command)
+        @jira.landed(issue)
+        puts Rainbow("Set issue #{issue.key} as 'Landed'\n").green
+      else
+        puts Rainbow("^ Whoops, something went wrong...").red
+      end
+    end
+  end
+end
+
+
+desc 'Setup your JIRA account, by creating a config file in ~/.jira_cli'
+command :setup do |c|
+  c.action do |global_options,options,args|
+
+    if @jira.setup_complete?
+      puts Rainbow("Looks like you already have an existing `#{@jira.config_file}` config file.").yellow
+      answer = ask('Overwrite file? [y, n]') { |q| q.in = ['y', 'n']; q.default = 'n' }
+      next if answer == 'n'
+    end
+
+    # Required information for the API
+    setup_config
+  end
+end
+
+pre do |global,command,options,args|
+  @jira = JiraCli::Jira.new
+  true
+end
+
+post do |global,command,options,args|
+  # Post logic here
+  # Use skips_post before a command to skip this
+  # block on that command only
+end
+
+on_error do |exception|
+  # Error logic here
+  # return false to skip default error handling
+  true
+end
+
+exit run(ARGV)
