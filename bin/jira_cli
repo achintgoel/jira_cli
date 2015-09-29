@@ -15,7 +15,7 @@ subcommand_option_handling :normal
 arguments :strict
 
 def setup_config
-  username    = ask("What's your JIRA username/email ")
+  username    = ask("What's your JIRA username ")
   password    = ask("What's your JIRA password ") { |q| q.echo = "x" }
   project_keys = ask("Project Key(s)? (For multiple projects, comma separate Keys) ")
 

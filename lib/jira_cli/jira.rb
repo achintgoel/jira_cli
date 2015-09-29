@@ -43,7 +43,7 @@ module JiraCli
         options = {
           :username => @username,
           :password => @password,
-          :site => 'https://zenpayroll.atlassian.net',
+          :site => 'https://gustohq.atlassian.net',
           :auth_type => :basic,
           :context_path => ''
         }
